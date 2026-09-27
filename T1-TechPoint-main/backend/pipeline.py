@@ -1,0 +1,274 @@
+"""Ties detection, tracking, the rules engine, severity scoring, and the
+alert manager together into a single per-frame `process()` call, and draws
+the overlay the dashboard displays (bounding boxes, zone polygons).
+"""
+import json
+import time
+from collections import deque
+from typing import Dict, List
+
+import cv2
+import numpy as np
+
+from backend import config
+from backend.alerts.manager import AlertManager
+from backend.analytics.rules import RuleEngine
+from backend.analytics.weapon_filter import WeaponTemporalFilter, _near
+from backend.analytics.weapon_verify import suppression_reason
+from backend.detection.object_detector import ObjectDetector
+from backend.detection.weapon_detector import WeaponDetection, WeaponDetector
+from backend.tracking import TrackManager
+from backend.zones import Zone, ZoneStore
+
+BOX_COLOR_PERSON = (255, 178, 60)   # BGR
+BOX_COLOR_ITEM = (60, 200, 255)
+BOX_COLOR_OTHER = (180, 180, 180)
+BOX_COLOR_WEAPON = (0, 0, 255)
+ZONE_COLOR_RESTRICTED = (0, 0, 220)
+ZONE_COLOR_NORMAL = (0, 200, 0)
+ZONE_COLOR_CROWD_WARN = (0, 191, 255)   # amber: above CROWD_WARN_FRACTION of the threshold
+ZONE_COLOR_CROWD_OVER = (0, 0, 255)     # red: at/over the threshold (the alert fires here too)
+
+
+class FramePipeline:
+    def __init__(
+        self,
+        object_detector: ObjectDetector = None,
+        weapon_detector: WeaponDetector = None,
+        zone_store: ZoneStore = None,
+        alert_manager: AlertManager = None,
+        lazy: bool = False,
+    ):
+        # lazy=True: the caller (a Camera) plugs in its own detectors on start.
+        self.object_detector = object_detector if lazy else (object_detector or ObjectDetector())
+        self.weapon_detector = weapon_detector if lazy else (weapon_detector or WeaponDetector())
+        self.camera = None  # set by backend.cameras.Camera; gives alerts their place
+        self.zone_store = zone_store or ZoneStore()
+        self.alert_manager = alert_manager or AlertManager()
+        self.rule_engine = RuleEngine()
+        self.track_manager = TrackManager()
+        self.weapon_filter = WeaponTemporalFilter()
+        # frame -> list of (17, 3) keypoint arrays; set by Camera.start. None = no pose check.
+        self.pose_fn = None
+        self.last_object_counts: Dict[str, int] = {}
+        # Purely visual smoothing for the weapon overlay: a per-class recent-
+        # confidence buffer (so the on-screen % doesn't jump frame to frame)
+        # and a short box-persistence window (so the box doesn't vanish for
+        # one dropped frame). Does NOT affect alert-firing logic below, which
+        # still runs on raw per-frame weapon_detections + weapon_filter.
+        self._weapon_display_state: Dict[str, dict] = {}
+        self._track_floor = 0.0
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        timestamp = time.time()
+        height, width = frame.shape[:2]
+        zones = [z.to_pixels(width, height) for z in self.zone_store.list()]
+
+        detections = self.object_detector.infer(frame)
+        tracks = self.track_manager.update(detections, timestamp)
+        self.last_tracks = tracks  # read by the per-camera analytics hooks (search, behaviour)
+        # Low-confidence throwables are tracked for throw detection only: the
+        # rules, overlay and counts see exactly what they saw before.
+        tracks = {tid: t for tid, t in tracks.items() if t.conf >= config.DETECTOR_CONF_THRESHOLD}
+        rule_alerts = self.rule_engine.evaluate(tracks, zones, timestamp)
+        # Low-floor detections (down to WEAPON_MIN_CONF) -- used only for
+        # keeping the on-screen box/label visually continuous. Anything that
+        # can actually raise a CRITICAL alert must additionally clear the
+        # stricter WEAPON_ALERT_MIN_CONF bar below.
+        weapon_detections = self.weapon_detector.infer(frame)
+        # None = the weapon model was skipped on this frame (WEAPON_EVERY_N_FRAMES):
+        # the 5-of-8 filter then stays untouched, it counts weapon evaluations.
+        weapon_evaluated = weapon_detections is not None
+        weapon_detections = weapon_detections or []
+        alert_eligible = [wd for wd in weapon_detections if wd.conf >= config.WEAPON_ALERT_MIN_CONF]
+        # A candidate on someone's face or t-shirt is their body, not a weapon:
+        # it neither counts toward the filter nor keeps an overlay alive.
+        people_kps, suppressed = [], []
+        if alert_eligible and self.pose_fn is not None and config.WEAPON_POSE_VERIFY:
+            people_kps = self.pose_fn(frame)
+            for wd in alert_eligible:
+                reason = suppression_reason(wd.bbox, people_kps)
+                if reason:
+                    suppressed.append((wd, reason))
+            if suppressed:
+                gone = {id(wd) for wd, _ in suppressed}
+                alert_eligible = [wd for wd in alert_eligible if id(wd) not in gone]
+                weapon_detections = [wd for wd in weapon_detections if id(wd) not in gone]
+
+        # Only a *sustained* weapon detection (seen in most of the last few
+        # frames) counts as confirmed -- a lone spurious hit from the
+        # detector doesn't get to trigger an alert OR the on-screen label.
+        # See weapon_filter.py. This runs before the display step below so
+        # the overlay can gate on the same bar as a real alert, not a
+        # single-frame threshold touch.
+        latest_by_class = {}
+        for wd in alert_eligible:  # strongest box per class
+            if wd.cls_name not in latest_by_class or wd.conf > latest_by_class[wd.cls_name].conf:
+                latest_by_class[wd.cls_name] = wd
+        confirmed_classes = set(self.weapon_filter.update(
+            {c: wd.bbox for c, wd in latest_by_class.items()}, frame_size=(width, height),
+            confs={c: wd.conf for c, wd in latest_by_class.items()})) if weapon_evaluated else set()
+
+        self._track_floor = config.WEAPON_TRACK_MIN_FRAC * (width ** 2 + height ** 2) ** 0.5
+        display_weapons = self._smooth_weapon_display(weapon_detections, confirmed_classes, timestamp)
+
+        annotated = frame.copy()
+        self._draw_zones(annotated, zones)
+        self._draw_tracks(annotated, tracks)
+        self._draw_weapons(annotated, display_weapons)
+        self._update_object_counts(tracks, alert_eligible)
+
+        if rule_alerts:
+            self.alert_manager.ingest_rule_alerts(rule_alerts, frame=annotated, camera=self.camera)
+
+        for cls_name in confirmed_classes:
+            wd = latest_by_class.get(cls_name)
+            if wd is None:
+                continue
+            alert = self.alert_manager.ingest_weapon_alert(
+                wd.cls_name, wd.conf, wd.bbox, timestamp, frame=annotated, camera=self.camera
+            )
+            if alert is not None:
+                self._dump_weapon_alert(alert, frame, weapon_detections, suppressed, people_kps)
+
+        return annotated
+
+    def _dump_weapon_alert(self, alert, frame, weapon_detections, suppressed, people_kps):
+        """debug/confirmed_alerts/alert_<id>.{jpg,json}: the raw (unannotated)
+        frame and everything the decision saw, so a false alarm can be traced."""
+        try:
+            out = config.WEAPON_DEBUG_DIR
+            out.mkdir(parents=True, exist_ok=True)
+            stem = out / f"alert_{alert.id}_{int(alert.timestamp)}"
+            cv2.imwrite(str(stem.with_suffix(".jpg")), frame)
+            det = lambda wd: {"cls": wd.cls_name, "conf": round(wd.conf, 4), "bbox": [round(v, 1) for v in wd.bbox]}
+            stem.with_suffix(".json").write_text(json.dumps({
+                "alert_id": alert.id, "camera_id": alert.camera_id, "ts": alert.timestamp,
+                "message": alert.message, "frame_size": list(frame.shape[:2]),
+                "raw_weapon_detections": [det(wd) for wd in weapon_detections],
+                "suppressed": [dict(det(wd), reason=r) for wd, r in suppressed],
+                "pose_people": [np.round(np.asarray(k, dtype=float), 3).tolist() for k in people_kps],
+            }, indent=1))
+        except Exception:  # debugging aid only; never break the frame loop
+            pass
+
+    def _smooth_weapon_display(self, weapon_detections, confirmed_classes, timestamp: float) -> List[WeaponDetection]:
+        """Purely cosmetic: average the last few frames' confidence per class
+        (so the on-screen % stops jumping around) and keep the last known box
+        drawn for a brief window even on a frame with no raw detection (so it
+        doesn't flicker in and out).
+
+        Gating: a class only enters display state once it's been *confirmed*
+        by weapon_filter this frame -- the same bar a real alert requires,
+        not just a single-frame threshold touch. Without this, a detection
+        that briefly touched the alert threshold once but never sustained
+        (and so never actually raised an alert) could still show a
+        misleading "CRITICAL THREAT" label with nothing in the alert feed to
+        back it up. Once confirmed and showing, any detection down to the
+        low floor keeps it alive/refreshed, which is what carries it through
+        a frame or two of motion blur without a fresh gap.
+        """
+        for wd in weapon_detections:
+            already_acquired = wd.cls_name in self._weapon_display_state
+            if not already_acquired and wd.cls_name not in confirmed_classes:
+                continue  # not yet confirmed by the temporal filter -- don't show it
+            if already_acquired and wd.conf < config.WEAPON_ALERT_MIN_CONF:
+                # A weak hit may only keep the box alive where the weapon is, not
+                # drag it onto some other object (seen: a box on empty snow).
+                last = self._weapon_display_state[wd.cls_name]["last_bbox"]
+                if not _near(wd.bbox, last, config.WEAPON_TRACK_DIST, self._track_floor):
+                    continue
+            state = self._weapon_display_state.setdefault(
+                wd.cls_name, {"conf_history": deque(maxlen=config.WEAPON_CONF_SMOOTH_WINDOW)}
+            )
+            state["conf_history"].append(wd.conf)
+            state["last_bbox"] = wd.bbox
+            state["last_seen_ts"] = timestamp
+
+        stale = [
+            cls_name
+            for cls_name, state in self._weapon_display_state.items()
+            if timestamp - state["last_seen_ts"] > config.WEAPON_BOX_PERSIST_SECONDS
+        ]
+        for cls_name in stale:
+            del self._weapon_display_state[cls_name]
+
+        display: List[WeaponDetection] = []
+        for cls_name, state in self._weapon_display_state.items():
+            smoothed_conf = sum(state["conf_history"]) / len(state["conf_history"])
+            display.append(WeaponDetection(cls_name=cls_name, conf=smoothed_conf, bbox=state["last_bbox"]))
+        return display
+
+    def _update_object_counts(self, tracks, weapon_detections):
+        counts: Dict[str, int] = {}
+        for track in tracks.values():
+            counts[track.cls_name] = counts.get(track.cls_name, 0) + 1
+        for wd in weapon_detections:
+            counts[wd.cls_name] = counts.get(wd.cls_name, 0) + 1
+        self.last_object_counts = counts
+
+    def _draw_zones(self, frame, zones: List[Zone]):
+        counts = self.rule_engine.zone_counts
+        for zone in zones:
+            if not zone.polygon:
+                continue
+            pts = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
+            color = ZONE_COLOR_RESTRICTED if zone.restricted else ZONE_COLOR_NORMAL
+            count = counts.get(zone.id, 0)
+            label = f"{zone.name}: {count}"
+            if zone.crowd_threshold:
+                label += f"/{zone.crowd_threshold}"
+                crowd_color = None
+                if count >= zone.crowd_threshold:
+                    crowd_color = ZONE_COLOR_CROWD_OVER
+                elif count > config.CROWD_WARN_FRACTION * zone.crowd_threshold:
+                    crowd_color = ZONE_COLOR_CROWD_WARN
+                if crowd_color is not None:
+                    color = crowd_color
+                    tint = frame.copy()
+                    cv2.fillPoly(tint, [pts], color)
+                    cv2.addWeighted(tint, 0.2, frame, 0.8, 0, dst=frame)
+            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+            x, y = zone.polygon[0]
+            cv2.putText(
+                frame, label, (int(x), int(y) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+            )
+
+    def _draw_tracks(self, frame, tracks):
+        for track in tracks.values():
+            x1, y1, x2, y2 = [int(v) for v in track.bbox]
+            if track.cls_name == config.PERSON_CLASS:
+                color = BOX_COLOR_PERSON
+            elif track.cls_name in config.ITEM_CLASSES:
+                color = BOX_COLOR_ITEM
+            else:
+                color = BOX_COLOR_OTHER
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{track.cls_name} #{track.track_id}"
+            cv2.putText(
+                frame, label, (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1,
+            )
+
+    def _draw_weapons(self, frame, weapon_detections):
+        for wd in weapon_detections:
+            x1, y1, x2, y2 = [int(v) for v in wd.bbox]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR_WEAPON, 4)
+            label = f"CRITICAL THREAT: {wd.cls_name.upper()} {wd.conf:.0%}"
+            font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2
+            (text_w, text_h), baseline = cv2.getTextSize(label, font, scale, thickness)
+            label_y = max(text_h + baseline + 4, y1)
+            # Solid background behind the label so it stays legible over any
+            # footage, not just dark backgrounds.
+            cv2.rectangle(
+                frame,
+                (x1, label_y - text_h - baseline - 4),
+                (x1 + text_w + 8, label_y),
+                BOX_COLOR_WEAPON,
+                -1,
+            )
+            cv2.putText(
+                frame, label, (x1 + 4, label_y - baseline),
+                font, scale, (255, 255, 255), thickness,
+            )
